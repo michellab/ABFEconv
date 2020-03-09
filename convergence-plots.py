@@ -9,13 +9,12 @@ import copy
 import numpy as np
 import math
 import matplotlib.pyplot as plt
+import pickle
 ### ADAPTIVE SAMPLING ROUTE
 NRUNS = 3
-#NEPOCHS = 12
 EPOCHTIME = 5 # ns  
 DISCARD = 0.5 # ns
 CHUNKSIZE = 0.5 # ns
-THRESHOLD = 0.1 #kcal/mol
 TIMESTEP = 0.000004 #ns
 NRGFREQ = 250
 ### HELPER FUNCTIONS
@@ -36,13 +35,13 @@ def doMBAR(simfiles, startime, endtime):
                 ostream.write(line)
                 continue
             elems = line.split()
-            time = float(elems[0])*TIMESTEP
+            time = (float(elems[0])+NRGFREQ)*TIMESTEP
             if (time < startime):
                 continue
             if (time > endtime):
                 break
             ostream.write(line)
-        cumtime += (time - startime)
+        cumtime += time#(time - startime)
         istream.close()
         ostream.close()
     # TODO ADD OVERLAP MATRIX TO OUTPUT
@@ -74,62 +73,62 @@ def doMBAR(simfiles, startime, endtime):
     return results
 
 
-def getNoisyWindows(energies,endtime, mythreshold=THRESHOLD):
-    noisy_windows = {}
-    for leg in ("bound","free"):
-	noisy_windows[leg] = {}
-        for stage in ("discharge","vanish"):
-	    noisy_windows[leg][stage] = []
-            windows = list(energies[1][leg][stage][(DISCARD,endtime)].keys())
-            windows.remove('DGtot')
-            avg_windows = {}
-            for window in windows:
-                avg_windows[window] = []
-                vals = []
-                for run in range(1,NRUNS+1):
-                    vals.append(energies[run][leg][stage][(DISCARD,endtime)][window][0])
-                std = np.array(vals).std()
-                avg_windows[window] = std
-                if std > mythreshold:
-                    noisy_windows[leg][stage].append( [window, std] )
-    return noisy_windows
-
 def calcEnergies(energies, basefolder, simprofile, startime, endtime):
     for run in range(1,NRUNS+1):
         for leg in ("bound","free"):
             for stage in ("discharge","vanish"):
                 rundir = "%s/%s/run00%d/%s/output/lambda-*/simfile.dat" % (basefolder,leg,run,stage)
                 simfiles = glob.glob(rundir)
-                try:
-                    energies[run]
-                except KeyError:
-                    energies[run] = {}
-                try:
-                    energies[run][leg]
-                except KeyError:
-                    energies[run][leg] = {}
-                try:
-                    energies[run][leg][stage] 
-                except KeyError:
-                    energies[run][leg][stage] = {}
-                try:
-                    energies[run][leg][stage][(startime,endtime)]
-                except KeyError:
-                    DG = doMBAR(simfiles, startime, endtime)
-                    print ("MBAR on %s, start %s, end %s, DG %s " % (rundir,startime,endtime,DG))
-                    energies[run][leg][stage][(startime,endtime)] = DG
+                # use analyse_freenrg to get free energy of chunks
+                nchunks = int(endtime/CHUNKSIZE)
+                for chunk in range(1,nchunks):
+                    try:
+                        energies[run]
+                    except KeyError:
+                        energies[run] = {}
+                    try:
+                        energies[run][leg]
+                    except KeyError:
+                        energies[run][leg] = {}
+                    try:
+                        energies[run][leg][stage] 
+                    except KeyError:
+                        energies[run][leg][stage] = {}
+                    startime = DISCARD
+                    chunkendtime = (chunk+1)*CHUNKSIZE
+                    try:
+                        DG = energies[run][leg][stage][(startime,chunkendtime)]
+                        print ("USING cached MBAR results for %s, start %s, end %s, DG %s " % (rundir,startime,chunkendtime,DG))
+                    except KeyError:
+                        # Check if all windows have a maxendtime < endtime, if so use previous endtime result
+                        maxsimfiletime = -1
+                        for simfile in simfiles:
+                            simfiletime = simprofile[run][leg][stage][simfile]
+                            if maxsimfiletime < simfiletime:
+                                maxsimfiletime = simfiletime
+                        if maxsimfiletime < chunkendtime:
+                            DG = energies[run][leg][stage][(startime,maxsimfiletime)]
+                            print ("No additional data to process over this time interval (%s-%s)" % (startime, chunkendtime))
+                            energies[run][leg][stage][(startime,chunkendtime)] = DG
+                            print ("reusing cached MBAR results %s, start %s, end %s, DG %s " % (rundir,startime,chunkendtime,DG))
+                        else:
+                            # Otherwise do MBAR from scratch
+                            DG = doMBAR(simfiles, startime, chunkendtime)
+                            print ("DOING NEW MBAR on %s, start %s, end %s, DG %s " % (rundir,startime,chunkendtime,DG))
+                            energies[run][leg][stage][(startime,chunkendtime)] = DG
+                        
 
-def plotDGbind(energies):
+def plotDGbind(energies, nepochs=0):
     runs = list(energies.keys())
-    chunks = energies[runs[0]]['bound']['discharge'].keys()
-    list(chunks).sort()
+    runs.sort()
+    chunks = list(energies[runs[0]]['bound']['discharge'].keys())
+    chunks.sort()
     x_vals = []
     y_vals = []
     error_vals = []
-    y_run1 = []
-    y_run2 = []
-    y_run3 = []
-    y_runs = [y_run1, y_run2, y_run3]
+    y_runs = []
+    for x in range(0,NRUNS):
+        y_runs.append([])
     for chunk in chunks:
         DGbinds = []
         cumtime = 0.0  
@@ -155,14 +154,17 @@ def plotDGbind(energies):
         y_vals.append(DGbind_avg)
         error_vals.append(DGbind_ste)
     
-    #ostream = open("plot.dat","w")
-    #for x in range(0,len(x_vals)):
-    #    line = " %8.5f " % x_vals[x]
-    #    for entry in y_runs:
-    #        line += " %8.5f " % entry[x]
-    #    line += " %8.5f %8.5f \n" % (y_vals[x],error_vals[x])
-    #    ostream.write(line)
-    #ostream.close()
+    ostream = open("convergence-epoch-%s.dat" % nepochs,"w")
+    header = "# cumulative_time DGrunX... avgDG 95CI\n"
+    ostream.write(header)
+    for x in range(0,len(x_vals)):
+        line = " %8.5f " % x_vals[x]
+        for entry in y_runs:
+            line += " %8.5f " % entry[x]
+        line += " %8.5f %8.5f \n" % (y_vals[x],error_vals[x])
+        ostream.write(line)
+    ostream.close()
+
     ##print (x_vals)
     ## Convergence plot
     #plt.plot(x_vals,y_vals)
@@ -173,35 +175,9 @@ def plotDGbind(energies):
     #plt.fill_between(x_vals, np.array(y_vals)-np.array(error_vals), np.array(y_vals)+np.array(error_vals), alpha=0.5, face#color='#ffa500' )
     #plt.show()
 
-def updateSimProfile(simprofile,noisy_windows,samplingtime):
-    for run in range(1,4):
-        for leg in ("bound","free"):
-            for stage in ("discharge","vanish"):
-                simfiles = simprofile[run][leg][stage].keys()
-                #print (simfiles)
-                for simfile in simfiles:
-                    # Ugly
-                    lamval = float(os.path.split(simfile)[-2].split("/")[-1].strip("lambda-"))
-                    #print (simfile)
-                    for window in noisy_windows:
-                        noisyleg = window[0]
-                        noisystage = window[1]
-                        noisylami, noisylamj = window[2].split('-')
-                        noisylami = float(noisylami)
-                        noisylamj = float(noisylamj)
-                        if (leg == noisyleg and stage == noisystage 
-                            and (abs(lamval-noisylami) < 0.01 or 
-                                 abs(lamval-noisylamj) < 0.01) ):
-                            print ("%s noisy, extending sampling to %s" % (simfile,samplingtime))
-                            simprofile[run][leg][stage][simfile] = samplingtime
-                            break
-                    
-
-
+         
 #####################
 basefolder = "./"
-
-energies={}
 simprofile={}
 # scan data to work out in which epoch we are
 maxendtime = -1
@@ -227,82 +203,17 @@ for run in range(1,NRUNS+1):
 print ("MAXIMUM SAMPLING TIME IS %s ns " % maxendtime)
 epoch = int(maxendtime/EPOCHTIME)
 print ("WE ARE IN EPOCH %s " % epoch)
+# Load cached energies (if any)
+if os.path.exists("energies.pickle"):
+    energies = pickle.load(open("energies.pickle","rb"))
+else:
+    energies = {}
 #sys.exit(-1)
 # Now compute energies for each sim using variable chunks
 calcEnergies(energies, basefolder, simprofile, DISCARD, maxendtime)
-print ("The binding free energy estimate is:")
-plotDGbind(energies)
-
-# Now prepare new submission script
-templateslurm = """#!/bin/bash
-#SBATCH -o adaptive-epoch-[epochnum]-job-%A.%a.out
-#SBATCH -p main
-#SBATCH -n 1
-#SBATCH --gres=gpu:1
-#SBATCH --time 24:00:00
-#SBATCH --array=0-[endarray]
-
-module load cuda/7.5
-
-echo "CUDA DEVICES:" $CUDA_VISIBLE_DEVICES
-
-lamvals=( [lamvals] )
-lam=${lamvals[SLURM_ARRAY_TASK_ID]}
-
-echo "lambda is: " $lam
-
-cd lambda-$lam
-
-export OPENMM_PLUGIN_DIR=/home/julien/sire.app/lib/plugins/
-
-srun /home/julien/sire.app/bin/somd-freenrg -C ../../input/sim-extend.cfg -l $lam -p CUDA
-cd ..
-
-wait
-"""
-
-# Now work out list of noisy windows
-noisy_windows = getNoisyWindows(energies,maxendtime, mythreshold=THRESHOLD)
-print ("The noisy windows (std > %s kcal/mol) are:" % THRESHOLD)
-for leg in noisy_windows.keys():
-    for stage in noisy_windows[leg].keys():
-	print ("for %s %s" % (leg,stage))
-        print (noisy_windows[leg][stage])
-	nwindows = len(noisy_windows[leg][stage])
-	if  nwindows == 0:
-	    continue
-	lamvals = []
-	for windowpair, std in noisy_windows[leg][stage]:
-	    winA, winB = windowpair.split("-")
-	    if not winA in lamvals:
-	        lamvals.append(winA)
-	    if not winB in lamvals:
-		lamvals.append(winB)
-	lamvals.sort()
-	print (lamvals)
-	lamvalstr = ""
-	for lv in lamvals:
-	    lamvalstr += "%.3f " % (float(lv))
-	for run in range(1,NRUNS+1):
- 	    rundir = "%s/%s/run00%d/%s/" % (basefolder,leg,run,stage)
-	    #sub file
-  	    ostream = open(os.path.join(rundir,"resub-epoch-%s.sh" % (epoch+1)),'w')
-	    slurm = copy.deepcopy(templateslurm)
-	    slurm = slurm.replace("[epochnum]","%s" % (epoch+1))
-	    slurm = slurm.replace("[endarray]","%s" % (len(lamvals)-1))
-	    slurm = slurm.replace("[lamvals]",lamvalstr)
-	    ostream.write(slurm)
-	    ostream.close()
-	    # config file
-	    ostream = open(os.path.join(rundir,"input/sim-extend.cfg"),'w')
-	    istream = open(os.path.join(rundir,"input/sim.cfg"),'r')
-	    buff = istream.readlines()
-	    for line in buff:
-	        if line.startswith("minimise"):
-		    ostream.write("minimise = False\n")
-		else:
-		    ostream.write(line)
-	    ostream.close()
-	    istream.close()
-sys.exit(-1)
+plotDGbind(energies, nepochs=epoch)
+# Save energies processed 
+dumpme = open("energies.pickle","wb")
+pickle.dump(energies, dumpme)
+dumpme.close()
 
